@@ -2,7 +2,7 @@
 import { EventEmitter } from 'node:events';
 import * as grpc from '@grpc/grpc-js';
 import {
-  cargarPaquete, ComandoOperador, Estacion, EstadoVolcan, Evento, LecturaSismica,
+  cargarPaquete, OPCIONES_KEEPALIVE, ComandoOperador, Estacion, EstadoVolcan, Evento, LecturaSismica,
   NivelAlerta, RespuestaOperador, ResumenEnvio, TipoSismo, Umbrales,
 } from './proto';
 
@@ -226,7 +226,7 @@ function crearImplementacion(obs: Observatorio): grpc.UntypedServiceImplementati
 export function iniciarServidorGrpc(puerto: number, host = '127.0.0.1'): Promise<{ server: grpc.Server; observatorio: Observatorio }> {
   const paquete = cargarPaquete();
   const observatorio = new Observatorio();
-  const server = new grpc.Server();
+  const server = new grpc.Server(OPCIONES_KEEPALIVE);
   server.addService(paquete.MonitoreoVolcanico.service, crearImplementacion(observatorio));
   return new Promise((resolve, reject) => {
     server.bindAsync(`${host}:${puerto}`, grpc.ServerCredentials.createInsecure(), (err) => {

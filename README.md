@@ -44,6 +44,20 @@ solo contenedor** con tres componentes que se comunican **solo por gRPC**:
 **Metadata:** el simulador envía `x-estacion-id`; el gateway envía `x-cliente: gateway-web` y
 `x-operador`. El servidor las lee con `call.metadata.get(...)` y las registra en el log.
 
+**Keepalive:** el servidor y los clientes envían un ping HTTP/2 cada 20 s (`keepalive_time_ms`) y esperan la respuesta 5 s (`keepalive_timeout_ms`). Así los streams largos detectan una conexión caída.
+
+**Códigos de estado usados:**
+
+| Código | Cuándo aparece |
+|---|---|
+| `OK` | Llamada exitosa (cualquier RPC). |
+| `NOT_FOUND` | `EnviarLecturas` recibe una lectura de una estación desconocida. |
+| `INVALID_ARGUMENT` | `EnviarLecturas` recibe una amplitud o frecuencia negativa. |
+| `DEADLINE_EXCEEDED` | `ObtenerEstado` no responde en 3 s; el gateway contesta HTTP 504. |
+| `CANCELLED` | El navegador cierra el WebSocket y el gateway hace `sub.cancel()`. Es esperado y se ignora. |
+
+Los errores de validación del operador (umbrales o nivel inválidos) no son códigos de estado: viajan como mensaje `error` dentro del stream bidireccional, que sigue abierto.
+
 **Interceptor:** todos los clientes gRPC del contenedor usan un interceptor de cliente
 (`src/metricas.ts`). Este cuenta las llamadas, los mensajes y los streams abiertos por tipo de RPC,
 y el gateway publica esas cifras cada 1 s.
@@ -55,6 +69,7 @@ y el gateway publica esas cifras cada 1 s.
 - **Tipo:** frecuencia < 5 Hz → **LP**; ≥ 5 Hz → **VT**. Si la estación ya tuvo 2 sismos en los últimos 10 s → **TREMOR**.
 - **Nivel**, según los sismos en una ventana deslizante de 5 min: ≥ 25 ROJO · ≥ 12 NARANJA · ≥ 5 AMARILLO · si no, VERDE. Se recalcula cada 2 s y con cada sismo, y emite `cambio_alerta` cuando cambia.
 - **Validación de umbrales:** amplitud > 0 y 1 ≤ amarillo < naranja < rojo.
+- **Enjambre:** el botón «Simular enjambre sísmico» es un control del simulador que el gateway invoca directamente, no una operación del dominio, por eso no está en el contrato gRPC.
 - **Simulador:** ruido de fondo de 5 a 25 µm/s y picos ocasionales (1,5 %). Un enjambre de 20 s sube la probabilidad de picos al 30 %, con amplitudes de 80 a 300 µm/s.
 
 ## Correr en local

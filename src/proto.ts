@@ -45,6 +45,12 @@ export interface RespuestaOperador {
   estado?: EstadoVolcan;
 }
 
+/** Keepalive HTTP/2 compartido por servidor y clientes: ping cada 20 s, 5 s para responder. */
+export const OPCIONES_KEEPALIVE = {
+  'grpc.keepalive_time_ms': 20_000,
+  'grpc.keepalive_timeout_ms': 5_000,
+};
+
 /** Devuelve el paquete `galeras.v1` cargado con proto-loader. */
 export function cargarPaquete(): any {
   const definicion = protoLoader.loadSync(RUTA_PROTO, OPCIONES_PROTO);
@@ -55,6 +61,7 @@ export function cargarPaquete(): any {
 export function crearCliente(direccion: string): any {
   const paquete = cargarPaquete();
   return new paquete.MonitoreoVolcanico(direccion, grpc.credentials.createInsecure(), {
+    ...OPCIONES_KEEPALIVE,
     interceptors: [interceptorMetricas],
   });
 }
