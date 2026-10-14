@@ -10,18 +10,37 @@ import { crearCliente, EstadoVolcan, Evento, RespuestaOperador } from './proto';
 import { snapshot } from './metricas';
 import { Simulador } from './simulador';
 
+const DEADLINE_UNARIO_MS = 3000;
+
+/** Metadata que el gateway adjunta a cada llamada gRPC. */
+function metadataGateway(operador = 'gateway'): grpc.Metadata {
+  const md = new grpc.Metadata();
+  md.set('x-cliente', 'gateway-web');
+  md.set('x-operador', operador);
+  return md;
+}
+
 const DIR_ESTATICO = process.env.STATIC_DIR ?? path.resolve(__dirname, '..', '..', 'Streaming', 'dist', 'Streaming', 'browser');
 
 export function iniciarGateway(puerto: number, direccionGrpc: string, simulador: Simulador): http.Server {
   const cliente = crearCliente(direccionGrpc);
-  const obtenerEstado = () =>
-    new Promise<EstadoVolcan>((res, rej) => cliente.ObtenerEstado({}, (err: Error | null, r: EstadoVolcan) => (err ? rej(err) : res(r))));
+  // Unario con deadline de 3 s: si vence, el error llega con status DEADLINE_EXCEEDED.
+  const obtenerEstado = (operador?: string) =>
+    new Promise<EstadoVolcan>((res, rej) =>
+      cliente.ObtenerEstado({}, metadataGateway(operador), { deadline: Date.now() + DEADLINE_UNARIO_MS },
+        (err: grpc.ServiceError | null, r: EstadoVolcan) => (err ? rej(err) : res(r))),
+    );
 
   const app = express();
   app.use(cors());
   app.get('/health', (_req, res) => { res.json({ ok: true }); });
   app.get('/api/estado', async (_req, res) => {
-    try { res.json(await obtenerEstado()); } catch (err) { res.status(502).json({ error: (err as Error).message }); }
+    try {
+      res.json(await obtenerEstado());
+    } catch (err) {
+      const e = err as grpc.ServiceError;
+      res.status(e.code === grpc.status.DEADLINE_EXCEEDED ? 504 : 502).json({ error: e.details ?? e.message, codigo: grpc.status[e.code] });
+    }
   });
   app.get('/api/metricas', (_req, res) => { res.json(snapshot()); });
   if (fs.existsSync(path.join(DIR_ESTATICO, 'index.html'))) {
@@ -34,17 +53,19 @@ export function iniciarGateway(puerto: number, direccionGrpc: string, simulador:
   const enviar = (ws: WebSocket, msg: unknown) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); };
   const difundir = (msg: unknown) => wss.clients.forEach((ws) => enviar(ws, msg));
 
-  wss.on('connection', (ws) => {
-    // 1) Unario: foto inicial del estado.
-    obtenerEstado().then((estado) => enviar(ws, { tipo: 'estado', estado })).catch(() => {});
+  wss.on('connection', (ws, req) => {
+    const operador = (new URL(req.url ?? '/ws', 'http://x').searchParams.get('operador') || 'anónimo').slice(0, 40);
 
-    // 2) Streaming del servidor: eventos en vivo.
-    const sub = cliente.SuscribirEventos({ incluir_lecturas: true });
+    // 1) Unario: foto inicial del estado.
+    obtenerEstado(operador).then((estado) => enviar(ws, { tipo: 'estado', estado })).catch(() => {});
+
+    // 2) Streaming del servidor: eventos en vivo. El CANCELLED al cerrar es esperado.
+    const sub = cliente.SuscribirEventos({ incluir_lecturas: true }, metadataGateway(operador));
     sub.on('data', (evento: Evento) => enviar(ws, { tipo: 'evento', evento }));
     sub.on('error', (err: grpc.ServiceError) => { if (err.code !== grpc.status.CANCELLED) console.error('[gateway] sub', err.message); });
 
     // 3) Bidireccional: sesión del operador de este navegador.
-    const sesion = cliente.SesionOperador();
+    const sesion = cliente.SesionOperador(metadataGateway(operador));
     sesion.on('data', (respuesta: RespuestaOperador) => enviar(ws, { tipo: 'operador', respuesta }));
     sesion.on('error', (err: grpc.ServiceError) => { if (err.code !== grpc.status.CANCELLED) console.error('[gateway] sesión', err.message); });
 

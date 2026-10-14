@@ -5,7 +5,6 @@ import {
   cargarPaquete, ComandoOperador, Estacion, EstadoVolcan, Evento, LecturaSismica,
   NivelAlerta, RespuestaOperador, ResumenEnvio, TipoSismo, Umbrales,
 } from './proto';
-import { contarMensajes, iniciarLlamada, terminarLlamada, TipoRpc } from './metricas';
 
 const VENTANA_MS = 5 * 60 * 1000;
 const RECALCULO_MS = 2000;
@@ -23,8 +22,8 @@ const ESTACIONES_BASE: Omit<Estacion, 'en_linea' | 'ultima_amplitud'>[] = [
 
 interface EstadoEstacion { ultimaLecturaReloj: number; ultimaAmplitud: number; ultimoSismoTs: number; sismosTs: number[]; }
 
-/** Estado del volcán y reglas de detección. Emite `evento` (Evento) por cada novedad. */
-export class Dominio {
+/** Dominio: estado del volcán y reglas de detección (solo lo usa el servidor gRPC). Emite `evento` (Evento) por cada novedad. */
+export class Observatorio {
   readonly eventos = new EventEmitter();
   private umbrales: Umbrales = { amplitud_sismo: 60, sismos_amarillo: 5, sismos_naranja: 12, sismos_rojo: 25 };
   private nivel: NivelAlerta = 'VERDE';
@@ -58,6 +57,10 @@ export class Dominio {
         return { ...base, en_linea: ahora - e.ultimaLecturaReloj < SIN_SENAL_MS, ultima_amplitud: e.ultimaAmplitud };
       }),
     };
+  }
+
+  existeEstacion(id: string): boolean {
+    return this.estaciones.has(id);
   }
 
   /** Procesa una lectura. Devuelve true si se detectó un sismo. */
@@ -121,96 +124,114 @@ export class Dominio {
   }
 }
 
-/** Construye las implementaciones de los 4 RPC sobre un Dominio. */
-function crearImplementacion(dominio: Dominio): grpc.UntypedServiceImplementation {
-  const medir = (tipo: TipoRpc, call: EventEmitter) => {
-    iniciarLlamada(tipo);
-    let terminada = false;
-    const fin = () => { if (!terminada) { terminada = true; terminarLlamada(tipo); } };
-    call.on('cancelled', fin);
-    call.on('close', fin);
-    call.on('finish', fin);
-    return fin;
-  };
+/** Lee una cabecera de metadata como texto ('' si no viene). */
+function leerMetadata(call: { metadata: grpc.Metadata }, clave: string): string {
+  return String(call.metadata.get(clave)[0] ?? '');
+}
+
+/** Construye las implementaciones de los 4 RPC sobre el Observatorio. */
+function crearImplementacion(obs: Observatorio): grpc.UntypedServiceImplementation {
+  const lotesPorEstacion = new Map<string, number>();
 
   return {
+    // 1) Unario: una petición → una respuesta.
     ObtenerEstado(call: grpc.ServerUnaryCall<unknown, EstadoVolcan>, callback: grpc.sendUnaryData<EstadoVolcan>) {
-      iniciarLlamada('unario');
-      contarMensajes('unario', 2);
-      callback(null, dominio.estado());
-      terminarLlamada('unario');
+      const cliente = leerMetadata(call, 'x-cliente') || 'desconocido';
+      if (cliente !== 'gateway-web') console.log(`[grpc] ObtenerEstado ← ${cliente}`);
+      callback(null, obs.estado());
     },
 
+    // 2) Streaming del cliente: muchas lecturas → un ResumenEnvio al cerrar el stream.
     EnviarLecturas(call: grpc.ServerReadableStream<LecturaSismica, ResumenEnvio>, callback: grpc.sendUnaryData<ResumenEnvio>) {
-      const fin = medir('streaming_cliente', call);
-      const resumen: ResumenEnvio = { estacion_id: '', lecturas_recibidas: 0, amplitud_maxima: 0, sismos_detectados: 0 };
+      const estacionMeta = leerMetadata(call, 'x-estacion-id');
+      const n = (lotesPorEstacion.get(estacionMeta) ?? 0) + 1;
+      lotesPorEstacion.set(estacionMeta, n);
+      if (n === 1 || n % 25 === 0) console.log(`[grpc] EnviarLecturas ← x-estacion-id=${estacionMeta || '(sin metadata)'} (lote ${n})`);
+
+      const resumen: ResumenEnvio = { estacion_id: estacionMeta, lecturas_recibidas: 0, amplitud_maxima: 0, sismos_detectados: 0 };
+      let terminado = false;
+      const fallar = (code: grpc.status, details: string) => {
+        terminado = true;
+        console.warn(`[grpc] EnviarLecturas ✘ ${grpc.status[code]}: ${details}`);
+        callback({ code, details } as grpc.ServiceError);
+      };
+
       call.on('data', (l: LecturaSismica) => {
-        contarMensajes('streaming_cliente');
+        if (terminado) return; // tras un error se ignora el resto del stream
+        if (!obs.existeEstacion(l.estacion_id)) return fallar(grpc.status.NOT_FOUND, `Estación desconocida: ${l.estacion_id}`);
+        if (l.amplitud_um_s < 0 || l.frecuencia_hz < 0) {
+          return fallar(grpc.status.INVALID_ARGUMENT, `Lectura inválida de ${l.estacion_id}: amplitud y frecuencia deben ser ≥ 0`);
+        }
         resumen.estacion_id = l.estacion_id;
         resumen.lecturas_recibidas++;
         resumen.amplitud_maxima = Math.max(resumen.amplitud_maxima, l.amplitud_um_s);
-        if (dominio.registrarLectura(l)) resumen.sismos_detectados++;
+        if (obs.registrarLectura(l)) resumen.sismos_detectados++;
       });
       call.on('end', () => {
-        contarMensajes('streaming_cliente');
-        callback(null, resumen);
-        fin();
+        if (!terminado) callback(null, resumen);
       });
     },
 
+    // 3) Streaming del servidor: una suscripción → eventos indefinidamente (nunca se llama call.end()).
     SuscribirEventos(call: grpc.ServerWritableStream<{ incluir_lecturas: boolean }, Evento>) {
-      const fin = medir('streaming_servidor', call);
-      contarMensajes('streaming_servidor');
+      console.log(`[grpc] SuscribirEventos ← x-cliente=${leerMetadata(call, 'x-cliente')} x-operador=${leerMetadata(call, 'x-operador')}`);
       const incluirLecturas = call.request.incluir_lecturas;
       const alEvento = (e: Evento) => {
-        if (e.lectura && !incluirLecturas) return;
-        contarMensajes('streaming_servidor');
+        if (e.payload === 'lectura' && !incluirLecturas) return;
         call.write(e);
       };
-      dominio.eventos.on('evento', alEvento);
-      const limpiar = () => { dominio.eventos.off('evento', alEvento); fin(); };
+      obs.eventos.on('evento', alEvento);
+      const limpiar = () => obs.eventos.off('evento', alEvento);
       call.on('cancelled', limpiar);
       call.on('close', limpiar);
+      call.on('error', limpiar);
     },
 
+    // 4) Bidireccional: comandos y respuestas fluyen de forma independiente en el mismo stream.
     SesionOperador(call: grpc.ServerDuplexStream<ComandoOperador, RespuestaOperador>) {
-      const fin = medir('bidireccional', call);
-      const responder = (r: RespuestaOperador) => { contarMensajes('bidireccional'); call.write(r); };
+      const operadorMeta = leerMetadata(call, 'x-operador') || 'operador';
+      console.log(`[grpc] SesionOperador abierta ← x-cliente=${leerMetadata(call, 'x-cliente')} x-operador=${operadorMeta}`);
+      const responder = (r: RespuestaOperador) => call.write(r);
+
       call.on('data', (c: ComandoOperador) => {
-        contarMensajes('bidireccional');
-        const quien = c.operador || 'operador';
+        const quien = c.operador || operadorMeta;
         if (c.accion === 'solicitar_estado') {
-          responder({ estado: dominio.estado() });
+          responder({ estado: obs.estado() });
         } else if (c.accion === 'ajustar_umbrales') {
-          const error = Dominio.validarUmbrales(c.ajustar_umbrales);
-          if (error) return responder({ error });
-          dominio.ajustarUmbrales(c.ajustar_umbrales!);
+          const error = Observatorio.validarUmbrales(c.ajustar_umbrales);
+          if (error) return responder({ error }); // el error viaja dentro del stream; la sesión sigue abierta
           const u = c.ajustar_umbrales!;
+          obs.ajustarUmbrales(u);
           responder({ ack: `${quien} ajustó umbrales: ${u.amplitud_sismo} µm/s · ${u.sismos_amarillo}/${u.sismos_naranja}/${u.sismos_rojo}` });
+          responder({ estado: obs.estado() });
         } else if (c.accion === 'confirmar_alerta') {
           const n = c.confirmar_alerta!;
           if (!NIVELES_VALIDOS.includes(n)) return responder({ error: 'Nivel de alerta no válido' });
-          dominio.confirmarNivel(n);
+          obs.confirmarNivel(n);
           responder({ ack: `${quien} confirmó el nivel ${n}` });
+          responder({ estado: obs.estado() });
         } else {
           responder({ error: 'Comando vacío: indique una acción' });
         }
       });
-      call.on('end', () => { call.end(); fin(); });
+      call.on('end', () => {
+        console.log(`[grpc] SesionOperador cerrada (${operadorMeta})`);
+        call.end();
+      });
     },
   };
 }
 
 /** Arranca el servidor gRPC en el puerto indicado (solo localhost). */
-export function iniciarServidorGrpc(puerto: number, host = '127.0.0.1'): Promise<{ server: grpc.Server; dominio: Dominio }> {
+export function iniciarServidorGrpc(puerto: number, host = '127.0.0.1'): Promise<{ server: grpc.Server; observatorio: Observatorio }> {
   const paquete = cargarPaquete();
-  const dominio = new Dominio();
+  const observatorio = new Observatorio();
   const server = new grpc.Server();
-  server.addService(paquete.MonitoreoVolcanico.service, crearImplementacion(dominio));
+  server.addService(paquete.MonitoreoVolcanico.service, crearImplementacion(observatorio));
   return new Promise((resolve, reject) => {
     server.bindAsync(`${host}:${puerto}`, grpc.ServerCredentials.createInsecure(), (err) => {
       if (err) return reject(err);
-      resolve({ server, dominio });
+      resolve({ server, observatorio });
     });
   });
 }

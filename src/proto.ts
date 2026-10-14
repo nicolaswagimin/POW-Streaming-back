@@ -2,6 +2,7 @@
 import path from 'node:path';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
+import { interceptorMetricas } from './metricas';
 
 export const RUTA_PROTO = path.join(__dirname, '..', 'proto', 'galeras.proto');
 
@@ -50,8 +51,10 @@ export function cargarPaquete(): any {
   return (grpc.loadPackageDefinition(definicion) as any).galeras.v1;
 }
 
-/** Crea un cliente del servicio MonitoreoVolcanico. */
+/** Crea un cliente del servicio MonitoreoVolcanico con el interceptor de métricas. */
 export function crearCliente(direccion: string): any {
   const paquete = cargarPaquete();
-  return new paquete.MonitoreoVolcanico(direccion, grpc.credentials.createInsecure());
+  return new paquete.MonitoreoVolcanico(direccion, grpc.credentials.createInsecure(), {
+    interceptors: [interceptorMetricas],
+  });
 }

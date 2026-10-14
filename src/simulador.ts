@@ -1,4 +1,5 @@
 // Simulador de estaciones: cada una es un cliente gRPC que usa streaming del cliente.
+import * as grpc from '@grpc/grpc-js';
 import { crearCliente, LecturaSismica, ResumenEnvio } from './proto';
 
 const ESTACIONES = ['ANG', 'CRA', 'URC', 'CUF'];
@@ -55,7 +56,9 @@ export class Simulador {
     while (this.activo) {
       try {
         await new Promise<ResumenEnvio>(async (resolve, reject) => {
-          const llamada = this.cliente.EnviarLecturas((err: Error | null, r: ResumenEnvio) => (err ? reject(err) : resolve(r)));
+          const metadata = new grpc.Metadata();
+          metadata.set('x-estacion-id', id);
+          const llamada = this.cliente.EnviarLecturas(metadata, (err: Error | null, r: ResumenEnvio) => (err ? reject(err) : resolve(r)));
           for (let i = 0; i < LECTURAS_POR_LOTE && this.activo; i++) {
             llamada.write(this.generarLectura(id));
             await esperar(INTERVALO_MS);
