@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+// Observatorio Galeras — monitoreo sísmico SIMULADO del volcán Galeras (Pasto, Nariño).
+package galeras.v1;
+
+service MonitoreoVolcanico {
+  // Unario: foto del estado actual del volcán.
+  rpc ObtenerEstado (ObtenerEstadoRequest) returns (EstadoVolcan);
+  // Streaming del cliente: una estación envía un lote de lecturas y recibe un resumen.
+  rpc EnviarLecturas (stream LecturaSismica) returns (ResumenEnvio);
+  // Streaming del servidor: el servidor empuja lecturas, sismos y cambios de alerta.
+  rpc SuscribirEventos (SuscripcionRequest) returns (stream Evento);
+  // Bidireccional: sesión interactiva del operador del observatorio.
+  rpc SesionOperador (stream ComandoOperador) returns (stream RespuestaOperador);
+}
+
+enum NivelAlerta { NIVEL_ALERTA_UNSPECIFIED = 0; VERDE = 1; AMARILLO = 2; NARANJA = 3; ROJO = 4; }
+enum TipoSismo   { TIPO_SISMO_UNSPECIFIED = 0; VT = 1; LP = 2; TREMOR = 3; }
+
+message LecturaSismica { string estacion_id = 1; int64 timestamp_ms = 2; double amplitud_um_s = 3; double frecuencia_hz = 4; }
+message ResumenEnvio   { string estacion_id = 1; int32 lecturas_recibidas = 2; double amplitud_maxima = 3; int32 sismos_detectados = 4; }
+message Estacion { string id = 1; string nombre = 2; double lat = 3; double lon = 4; bool en_linea = 5; double ultima_amplitud = 6; }
+message Umbrales { double amplitud_sismo = 1; int32 sismos_amarillo = 2; int32 sismos_naranja = 3; int32 sismos_rojo = 4; }
+message EstadoVolcan { NivelAlerta nivel = 1; repeated Estacion estaciones = 2; int32 sismos_ventana = 3; Umbrales umbrales = 4; NivelAlerta nivel_confirmado = 5; }
+message SismoDetectado { string estacion_id = 1; double amplitud = 2; double frecuencia_hz = 3; TipoSismo tipo = 4; }
+message CambioAlerta { NivelAlerta anterior = 1; NivelAlerta nuevo = 2; string motivo = 3; }
+message Evento {
+  int64 timestamp_ms = 1;
+  oneof payload { LecturaSismica lectura = 2; SismoDetectado sismo = 3; CambioAlerta cambio_alerta = 4; }
+}
+message ComandoOperador {
+  string operador = 1;
+  oneof accion { Umbrales ajustar_umbrales = 2; NivelAlerta confirmar_alerta = 3; bool solicitar_estado = 4; }
+}
+message RespuestaOperador { oneof resultado { string ack = 1; string error = 2; EstadoVolcan estado = 3; } }
+message ObtenerEstadoRequest {}
+message SuscripcionRequest { bool incluir_lecturas = 1; }
